@@ -24,15 +24,3 @@ Bulk RNA-seq was performed on astrocytes after they were culture with neurons an
 
  <img src="images/pipeline.png" width="400" >
 
-## This Repository  
-
-Folders:
-
-sargasso_alignment - the scripts used to run species filtering alignment and gene counts
-
-differential-gene-expression - contains the scripts and notebooks to perform differential gene expression analysis, gene ontology analysis, and gene set enrichment analysis  
-  
-qPCR_validation - notebook for the correlation of estimated log fold changes from RNA-seq to measured log fold changes from qPCR   
-
-splicing - contains the scripts and notebooks used to perform differential splicing analysis
-Preview for  Martinez-Lozada, Farmer, et al, 2023
