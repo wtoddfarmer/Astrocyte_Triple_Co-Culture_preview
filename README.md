@@ -18,7 +18,7 @@ Astrocytes have essential roles in central nervous system (CNS) health and disea
 
 ![](images/Graphical_Abstract.png)
 
-Bulk RNA-seq was performed on astrocytes after they were culture with neurons and/or endotheilial cells.
+Bulk RNA-seq was performed on astrocytes after they were cultured with neurons and/or endotheilial cells.
 
 ## The Pipeline  
 
