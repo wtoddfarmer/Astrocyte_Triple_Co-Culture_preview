@@ -1,0 +1,1060 @@
+---
+title: "Astrocyte Triple Culture RNA-Seq Analysis"
+author: "Todd Farmer"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output:
+  html_document:
+    df_print: paged
+    #number_sections: yes
+    toc: yes
+    toc_float: yes
+    code_folding: show
+editor_options:
+  chunk_output_type: inline
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(cache = FALSE,
+                      echo = TRUE,
+                      warning = FALSE, 
+                      message = FALSE, 
+                      cache.lazy = FALSE, 
+                      dev = c("png"), 
+                      fig.keep = 'high', 
+                      fig.path="figures/", 
+                      fig.show="asis")
+```
+
+```{r libraries, echo=FALSE}
+
+library(stringr)
+library(knitr)
+library(rmarkdown)
+library(ggplot2)
+library(plotly)
+library(ggpubr)
+library(tidyverse)
+library(DESeq2) 
+library(pheatmap)
+library(ggrepel)
+library(RColorBrewer)
+library(org.Mm.eg.db)
+library(EnsDb.Mmusculus.v79)
+library(biomaRt)
+library(dplyr)
+library(Seurat)
+library(clusterProfiler) 
+library(enrichplot)  
+library(DEGreport)  
+library(xlsx)
+library(fgsea)
+source("functions.R")
+select <- dplyr::select
+
+```
+
+# The Sequencing Pipeline in the Notebook  
+
+![](figures/DEG_pipeline.png){width="400"}
+
+# Load QC Data  
+
+```{r files}
+meta_data_qc_file <- "data/sample_metadata.csv"
+filtering_summary_file <- "data/overall_filtering_summary.txt" # output from sargasso
+rat_counts_file <- "data/rat_counts_astro.tsv"
+mouse_counts_file <- "data/mouse_counts.tsv"
+rin <- read.xlsx("data/Genome_Quebec_QC_20201208.xlsx", 1) %>% 
+  dplyr::select( -NA.) %>%
+ mutate(Alias = replace(Alias, Alias == "AN_3", "AN_G3")) %>% 
+ relocate(Name, Alias, RIN)
+reads <- read.xlsx("data/Astro_Endo_Neuron_RNAseq_samples.xlsx", 1) %>%
+  relocate(Name, Number.of.Reads.NovaSeq)
+```
+
+## RNA Integrity
+
+```{r}
+rin
+```
+
+The average RIN is `r rin %>% filter(RIN != 0) %>% pull(RIN) %>% mean()`.
+
+## Number of Reads
+
+```{r}
+reads
+```
+
+The total number of reads is `r reads %>% pull(Number.of.Reads.NovaSeq) %>% sum()`.
+
+The average number of reads per sample is `r reads %>% pull(Number.of.Reads.NovaSeq) %>% mean()` with a sd of `r reads %>% pull(Number.of.Reads.NovaSeq) %>% sd()`
+
+
+# The Count Data  
+The mouse sequence reads used in this publication were filtered from contaminating rat reads originating from neuronal cultures by using [Sargasso](https://github.com/biomedicalinformaticsgroup/Sargasso). Briefly, reads were sorted as either rat or mouse after aligning with STAR to GRCm38 and Rnor 6.0. Downstream analysis was performed on only the filtered mouse reads.       
+
+## Load Count Data  
+```{r}
+
+meta_data_qc <- read.csv(meta_data_qc_file, stringsAsFactors = TRUE ) %>% select(-X )
+rownames(meta_data_qc) <- meta_data_qc$sample
+
+filtering_summary <- read.csv(filtering_summary_file) %>% 
+  mutate(Total.Assigned.Reads = Assigned.Reads.mouse + Assigned.Reads.rat) %>% 
+  mutate(Percent.Aligned.Mouse = round(Assigned.Reads.mouse/Total.Assigned.Reads*100, 3)) %>%
+  mutate(Sample = replace(Sample, Sample == "AN_3", "AN_G3")) %>%
+  left_join(meta_data_qc, by = c("Sample"="sample"))
+
+rat_counts <- read.csv(rat_counts_file, header = TRUE, sep = ",")
+rownames(rat_counts) <- rat_counts[,"gene"]
+rat_counts <- rat_counts %>%
+  select(sort(tidyselect::peek_vars()))
+
+mouse_counts <- read.csv(mouse_counts_file, header = TRUE, sep = "\t")
+rownames(mouse_counts) <- mouse_counts[,"gene"]
+mouse_counts <- mouse_counts %>%
+  select(-X) %>%
+  dplyr::rename("AN_G3" = AN_3) %>%
+  select(sort(tidyselect::peek_vars()))
+
+```
+
+```{r aligned_reads}
+ggplot(filtering_summary) +
+  geom_point(mapping=aes(culture, Assigned.Hits.mouse, color=cell_type, shape="Mm10")) +
+  geom_point(mapping=aes(culture, Assigned.Hits.rat, color=cell_type, shape="Rnor6.0")) +
+  ggtitle("Number of Reads Aligned to\nMouse (Mm10) and Rat (Rnor6.0)") +
+  scale_color_hue("Cell Type") +
+  scale_shape("Species") +
+  ylab("Number of Aligned Reads") + theme_pub()
+  
+```
+
+```{r}
+filtering_summary %>%
+  select(Sample, culture, Assigned.Reads.mouse, Assigned.Reads.rat)  
+  
+
+```
+
+## Percent alignment to mouse genome  
+
+
+
+```{r}
+
+filtering_summary %>% ggplot() + 
+  geom_boxplot(mapping=aes(culture, Percent.Aligned.Mouse)) +
+  geom_point(mapping=aes(culture, Percent.Aligned.Mouse)) +
+
+  ylim(0,100) + 
+  ggtitle("Percent of Aligned Reads Aligned to Mouse Genome") +
+  
+  ylab("Number of Aligned Reads") + theme_pub()
+
+```
+
+
+# Create a DeSeq2 object using all samples.  
+This object will be used to estimate the endothelial contamination resulting from imperfect FACS isolation of the astrocyte samples.     
+
+```{r make_dds_qc}
+rownames(mouse_counts) <- mouse_counts$gene
+mouse_counts <- mouse_counts %>% select(-gene)
+rownames(meta_data_qc) <- meta_data_qc$sample
+dds_qc <- DESeqDataSetFromMatrix(
+  countData = mouse_counts %>% select(sort(tidyselect::peek_vars())),
+  colData   = meta_data_qc %>% select(cell_type, culture),
+  design    = ~ culture + cell_type)
+
+dds_qc$culture <- factor(dds_qc$culture, levels = c("A", "AN", "AE", "AEN", "E"))
+# Minimal pre-filtering:
+keep_rows <- rowSums(counts(dds_qc)) > 10
+dds_qc       <- dds_qc[keep_rows, ]
+```
+
+```{r }
+dds_qc<-DESeq(dds_qc)
+
+```
+
+```{r vsd}
+vsd <- varianceStabilizingTransformation(dds_qc, blind = TRUE)
+```
+
+## Normalized Counts of the EC-specific gene Tie1  
+
+```{r tie1}
+plotCounts_gg(dds_qc, "Tie1", normalized = TRUE) + theme_pub()
+```
+
+Note: Tie1 counts in the co-cultures containing ECs indicates the presence of EC contamination.  
+
+  
+
+# Estimating percent contamination
+
+## Pure endo and astro samples were used to deconvolve the cellular composistion of mixed samples
+
+A single representative sample for astrocytes and endotheilial cells was created by taking the average read count of the pure culture samples for each gene. The percent composition of each co-culture sample was estimated using DeSeq2::unmix(). Note that we do not have a pure sample of the neuron culture to check for neuronal contamination. Since rat neuronal cultures were used, much the neuronal contamination should have been removed by Sargasso.
+
+```{r}
+pure_astro_samples <- rownames(meta_data_qc[meta_data_qc$culture == c('A'),])
+pure_endo_samples <- rownames(meta_data_qc[meta_data_qc$culture == c('E'),])
+pure_astro_norm_counts <- as.data.frame(rowMeans(counts(dds_qc, normalized=TRUE)[,pure_astro_samples]))
+colnames(pure_astro_norm_counts)<- c('astro')
+pure_endo_norm_counts <- as.data.frame(rowMeans(counts(dds_qc, normalized=TRUE)[,pure_endo_samples]))
+colnames(pure_endo_norm_counts)<- c('endo')
+
+pure_norm_counts <- cbind(pure_astro_norm_counts, pure_endo_norm_counts )
+```
+
+```{r}
+mixed_samples <- rownames(meta_data_qc[meta_data_qc$culture %in% c('AE', 'AEN'),])
+mixed_norm_counts <- counts(dds_qc, normalized=TRUE)[,mixed_samples]
+norm_counts <- counts(dds_qc, normalized=TRUE)
+```
+
+## Estimated proportions of each sample
+
+```{r}
+contam_matrix <- unmix(norm_counts, as.matrix(pure_norm_counts), alpha=dds_qc$sizeFactor, quiet = TRUE) %>%
+  as.data.frame() %>%
+  rownames_to_column(var="sample")
+
+```
+
+```{r}
+contam_meta <- contam_matrix %>%
+  left_join(meta_data_qc[, c("cell_type", "culture")] %>%
+  rownames_to_column(var="sample"), by = 'sample') 
+write.csv(contam_meta, file = "results/contam_matix.csv", sep = ",")
+
+contam_meta
+```
+
+# Differential Gene Expression Analysis of Astrocytes Across Culture Conditions
+
+## Metadata  
+```{r}
+astro_meta_data <- contam_meta %>% filter((cell_type == 'astrocyte'))
+rownames(astro_meta_data) <- astro_meta_data$sample
+astro_meta_data <- astro_meta_data %>% select(-sample)
+astro_meta_data$culture <- factor(astro_meta_data$culture, levels = c("A", "AN", "AE", "AEN"))
+astro_meta_data
+```
+
+## Estimated Proportion of Endotheilial Contamination in Astrocyte samples
+
+```{r endo_Contam}
+# pdf(file= "figures/endo_Contam.pdf", width = 4, height = 3)
+ggplot(contam_meta, aes(x=culture, y=endo, color=cell_type)) + 
+  geom_jitter(size=2, alpha=0.5, width = 0.2) +
+  ylab("Estimated Endothelial\nContamination") + 
+  theme_pub()
+# dev.off()
+```
+
+
+## Selecting the rows and columns to be used for differential gene expression analysis.
+
+First, only the columns of counts that correspond to the astrocyte samples were selected. Since there is evidence (significant counts for endo specific genes eg. Tie1), only the genes that have counts in the pure astro samples are selected.\
+The analysis performed in this notebook uses only the genes that have \>20 counts in each of the pure astrocyte samples. This was done to avoid detecting the presence of endothielial contamination as differential expression.
+
+
+```{r read_astro_count_data}
+
+astro_count_data <- mouse_counts %>% select(rownames(astro_meta_data)) %>% select(sort(tidyselect::peek_vars()))
+
+# Filtering to contain only genes in the pure astro samples:
+pure_astro_samples <- rownames(astro_meta_data[astro_meta_data$culture == c('A'),])
+pure_astro_counts <- astro_count_data[,pure_astro_samples]
+non_zero_rows <- rowSums(astro_count_data) > 0
+keep_rows <- !rowSums(pure_astro_counts < 20) > 0
+astro_count_data <- astro_count_data[keep_rows, ]
+astro_samples <- rownames(astro_meta_data[astro_meta_data$cell_type=='astrocyte',])
+```
+
+The number of genes have reduced from `r nrow( mouse_counts)` to `r nrow(astro_count_data)`.
+
+# Uncorrected Deseq2 Model
+
+This model does not regress out estimated endothelial contamination. It is only used as a comparison the qRT-PCR validation which does not take into account of the cellular contamination.
+
+```{r}
+astro_uncorrected <- DESeqDataSetFromMatrix(
+  countData = astro_count_data,
+  colData   = astro_meta_data,
+  design    = ~culture)
+
+astro_uncorrected$culture <- factor(astro_uncorrected $culture, levels = c("A", "AN", "AE", "AEN"))
+
+
+```
+
+The DeSeq2 model used in this DESeq2 object is `r as.character(design(astro_uncorrected))`.
+
+  
+## LRT test without correction for endotelial contamination.
+
+```{r}
+astro_uncorrrected_lrt <- DESeq(astro_uncorrected, test="LRT", reduced = ~ 1)
+lrt_uncorrected_res <- results(astro_uncorrrected_lrt)
+summary(lrt_uncorrected_res)
+```
+
+## Pair-wise Tests on uncorrected
+
+Perform pair-wise tests between all conditions and join lfc, padj to lfc, padj from LRT to compare to qRT-PCR validation.  
+
+```{r}
+combos <- combn(levels(astro_uncorrected$culture), 2)
+lrt_uncorrected_res2 <- lrt_uncorrected_res %>% as.data.frame %>%
+  dplyr::select(baseMean, log2FoldChange, padj) %>%
+  rename_at(vars(names(.)), function(x) paste0(x, "_" ,"lrt")) %>%
+  add_rownames("gene")
+
+for (n in 1:ncol(combos)){
+  name <- paste(combos[1,n], combos[2,n], sep = "_")[[1]]
+  res <-lfcShrink(astro_uncorrrected_lrt, contrast = c("culture", combos[2,n], combos[1,n]), type = "ashr")
+  res <- res %>% as.data.frame %>%
+    dplyr::select(log2FoldChange, padj) %>%
+    rename_at(vars(names(.)), function(x) paste0(x, "_" ,name)) %>%
+    add_rownames("gene")
+  lrt_uncorrected_res2 <- lrt_uncorrected_res2 %>% left_join(res, by="gene")
+}
+
+```
+
+```{r}
+write.csv(lrt_uncorrected_res2 %>% arrange(padj_lrt) %>% relocate(gene), "uncorrected_DEGs.csv")
+```
+
+# Deseq2 Model using EC contamination as a factor  
+
+```{r}
+astro <- DESeqDataSetFromMatrix(
+  countData = astro_count_data,
+  colData   = astro_meta_data,
+  design    = ~culture + endo)
+
+astro$culture <- factor(astro$culture, levels = c("A", "AN", "AE", "AEN"))
+
+
+```
+
+The DeSeq2 model used in this notebook is `r as.character(design(astro))`.
+
+```{r factors}
+astro<-DESeq(astro)
+```
+
+## Dispersion Plot
+
+```{r dispersions}
+plotDispEsts(astro)
+```
+
+## Calculate transformations used in heatmaps and other visulaizations.  
+
+```{r}
+astro_vsd <- varianceStabilizingTransformation(astro, blind = FALSE)
+astro_lrd <- rlog(astro, blind = FALSE)
+# head(assay(vsd), 3)
+```
+
+## Raw Counts of Marker Genes  
+Based on previous experiments, these two genes are expected to increase expression in the triple culture.  
+
+```{r glt_plot}
+plotCounts_gg(astro, "Slc1a2", normalized = TRUE) +
+  #scale_y_continuous(trans='log10') 
+  theme_pub()
+```
+
+```{r egfp_plot}
+ plotCounts_gg(astro, "eGFP", normalized = TRUE) +
+  theme_pub()
+  #scale_y_continuous(trans='log10')
+```
+
+## Sample Distributions
+
+```{r sampleDists}
+sampleDists <- dist(t(assay(astro_vsd)))
+sampleDistMatrix <- as.matrix( sampleDists )
+#rownames(sampleDistMatrix) <- paste(astro_vsd$cell_type,rownames(sampleDistMatrix), sep = " - " )
+colnames(sampleDistMatrix) <- NULL
+colors <- colorRampPalette( rev(brewer.pal(9, "Blues")) )(255)
+pheatmap(sampleDistMatrix,
+         clustering_distance_rows = sampleDists,
+         clustering_distance_cols = sampleDists,
+         col = colors) 
+```
+
+## PCA Plot
+
+```{r astro_PCA, fig.width=6, fig.height=4}
+# pdf(file= "figures/astro_PCA.pdf", width = 6, height = 4)
+plotPCAWithSampleNames(astro_vsd, c("cell_type", "culture")) + theme_pub()
+# dev.off()
+```
+
+## Heatmap of PC1
+
+```{r PC1heatmap}
+pcaHeatmap(astro_vsd, 30, "PC1")
+```
+
+## Heatmap of PC2
+
+```{r PC2heatmap}
+pcaHeatmap(astro_vsd, 30, "PC2")
+```
+
+## Heatmap of PC3
+
+```{r PC3heatmap}
+pcaHeatmap(astro_vsd, 30, "PC3")
+```
+
+# Statical Tests for Differential Expression followed by Clustering Based on Expression Pattern
+
+## Likelihood Ratio Test
+
+LRT tests for significant differences across all conditions simultaneously. It will give us the differentially expressed genes across all conditions but does not provide pair-wise estimates of fold-changes or pair-wise p-values.  
+
+```{r lrt}
+astro_lrt <- DESeq(astro, test="LRT", reduced=~endo)
+lrt_res <- results(astro_lrt )
+summary(lrt_res)
+```
+
+```{r annotation}  
+# Annotate the genes in the results table.  
+lrt_res$gene_name <- convertIDs(row.names(lrt_res), 'SYMBOL', 'GENENAME', org.Mm.eg.db )
+lrt_res$entrezid <- convertIDs( row.names(lrt_res), 'SYMBOL', 'ENTREZID', org.Mm.eg.db )
+
+```
+
+```{r}
+lrt_sig <- as.data.frame(lrt_res) %>% filter(!is.na(padj) &
+                                abs(log2FoldChange) > 2 &
+                                 padj < 0.05) %>% dplyr::arrange(padj)
+lrt_sigGenes <- row.names(lrt_sig) 
+```
+
+```{r lrt_heatmap, fig.width=6, fig.height=8}
+# pdf(file= "figures/lrt_heatmap.pdf", width = 6, height = 10)
+resultsHeatmap(results = lrt_sig, vsd = astro_lrd, meta_data = astro_meta_data, 100)
+# dev.off()
+```
+  
+## Cluster genes based on pattern of changes across samples.  
+
+The LRT revealed thousands of differentially expressed genes between the 4 conditions. To better grasp the large biological changes that are occuring during co-culture, the DEGs were clustered into groups based on differences across culture conditions using degPatterns.
+
+Regularized log transformed count data was used to cluster genes by the DIANA algorithm. This is computationally intensive, so the object will be loaded if it is already calculated.  
+
+```{r clusters}
+
+sig_rld <- assay(astro_lrd[lrt_sigGenes,] )
+
+if(file.exists("results/astro_clusters.RDS")){
+  astro_clusters_rld <- readRDS("results/astro_clusters.RDS")
+ }else{
+  astro_clusters_rld <- degPatterns(ma = sig_rld, metadata = astro_meta_data, time="culture", plot = FALSE, fixy = c(-2,2) )
+  saveRDS(astro_clusters_rld, file = "results/astro_clusters.RDS")
+}
+```
+
+```{r}
+# rename clusters to correspond to patterns of changes
+cluster_rename <- data_frame("new" = c("S1","S2", "C1", "C2", "C3", "C4", "C5", "C6"),
+                             "cluster" = c(3, 5, 2, 6, 4, 1, 8, 7))
+
+```
+
+```{r}
+cluster_data <- astro_clusters_rld$normalized %>%
+  select(genes, value, culture, cell_type, cluster) %>%
+  left_join(cluster_rename, by = "cluster") %>%
+  mutate(cluster = new) %>%
+  select(-new)
+cluster_gene_counts <- table(distinct(cluster_data, genes, cluster)[["cluster"]])
+cluster_titles <- data.frame(cluster = names(cluster_gene_counts),
+            title = paste("cluster ", names(cluster_gene_counts),"- genes:", cluster_gene_counts), stringsAsFactors = FALSE)
+cluster_data <- cluster_data %>% left_join(cluster_titles, by = "cluster")
+cluster_data 
+```
+
+## Pair-wise Tests
+
+Perform pair-wise tests between all conditions and join lfc, padj to lfc, padj, and cluster from LRT. This yields our final results table for differential expression after adding gene annotations.  
+
+```{r}
+combos <- combn(levels(astro$culture), 2)
+lrt_res2 <- lrt_res %>% as.data.frame %>%
+  dplyr::select(baseMean, log2FoldChange, padj) %>%
+  rename_at(vars(names(.)), function(x) paste0(x, "_" ,"lrt")) %>%
+  add_rownames("gene")
+
+for (n in 1:ncol(combos)){
+  name <- paste(combos[1,n], combos[2,n], sep = "_")[[1]]
+  res <-lfcShrink(astro, contrast = c("culture", combos[2,n], combos[1,n]), type = "ashr")
+  res <- res %>% as.data.frame %>%
+    dplyr::select(log2FoldChange, padj) %>%
+    rename_at(vars(names(.)), function(x) paste0(x, "_" ,name)) %>%
+    add_rownames("gene")
+  lrt_res2 <- lrt_res2 %>% left_join(res, by="gene")
+}
+lrt_res2 <- lrt_res2 %>% left_join(astro_clusters_rld$df, by = c("gene" = "genes") )
+
+
+lrt_res2$gene_name <- convertIDs(lrt_res2$gene, 'SYMBOL', 'GENENAME', org.Mm.eg.db )
+
+```
+
+```{r}
+# rename clusters
+lrt_res2 <- lrt_res2 %>% left_join(cluster_rename, by = "cluster") %>% mutate(cluster = new) %>% select(-new)
+```
+
+These are the differentially expressed genes and their respective p-values and log-fold changes for the both the LRT and all pairwise tests. DEGs were filtered by adjusted p-value \> 0.05 and log-fold change \> 2 in the LRT.
+  
+```{r resultsTable}
+sig_all_res <- lrt_res2 %>% filter(padj_lrt < 0.05) %>% arrange(padj_lrt) %>% relocate(gene, gene_name, cluster)
+paged_table(sig_all_res)
+```
+
+```{r}
+# The final DEG results table  
+write.csv(lrt_res2 %>% arrange(padj_lrt) %>% relocate(gene, gene_name, cluster), "DEGs_allGenes_allStats.csv")
+```  
+
+# Clusters of Differentially Expressed Genes
+
+```{r clusterPlot}
+#pdf("figures/clusterPlot.pdf")
+color = "m"
+splan <- length(unique(cluster_data[["culture"]])) - 1L
+ggplot(cluster_data, aes(x=culture, y =value)) + 
+  geom_violin(fill="white") +
+ geom_jitter(width = 0.3, alpha=0.2, size=0.1) + 
+ geom_line(aes(group = genes), alpha=0.01) +
+  stat_smooth(aes(x = culture, y = value,
+                               group = cell_type),
+                    se = FALSE,
+                    method = "lm", formula = y~poly(x, splan)) +
+  facet_wrap(facets = "title") +
+  ylab("Z-score of gene abundance") + 
+  theme_pub()
+#dev.off()
+```
+
+
+## Calculate the proportion of genes that are up- and down-regulated comapred to the A condition alone.  
+  
+```{r}
+print("AvAN")
+print(paste0("Downregulated genes: ", 
+            nrow(lrt_res2 %>% filter(padj_A_AN < 0.05, log2FoldChange_A_AN <0 )), " Percent: ",
+            nrow(lrt_res2 %>% filter(padj_A_AN < 0.05, log2FoldChange_A_AN <0 ))/nrow(lrt_res2),"%"
+            )
+      )
+print(paste0("UPregulated genes: ", 
+            nrow(lrt_res2 %>% filter(padj_A_AN < 0.05, log2FoldChange_A_AN >0 )), " Percent: ",
+            nrow(lrt_res2 %>% filter(padj_A_AN < 0.05, log2FoldChange_A_AN >0 ))/nrow(lrt_res2),"%"
+            )
+      )
+
+```
+
+```{r}
+print("AvAE")
+print(paste0("Downregulated genes: ", 
+            nrow(lrt_res2 %>% filter(padj_A_AE < 0.05, log2FoldChange_A_AE <0 )), " Percent: ",
+            nrow(lrt_res2 %>% filter(padj_A_AE < 0.05, log2FoldChange_A_AE <0 ))/nrow(lrt_res2),"%"
+            )
+      )
+print(paste0("UPregulated genes: ", 
+            nrow(lrt_res2 %>% filter(padj_A_AE < 0.05, log2FoldChange_A_AE >0 )), " Percent: ",
+            nrow(lrt_res2 %>% filter(padj_A_AE < 0.05, log2FoldChange_A_AE >0 ))/nrow(lrt_res2),"%"
+            )
+      )
+
+```
+
+```{r}
+print("AvAEN")
+print(paste0("Downregulated genes: ", 
+            nrow(lrt_res2 %>% filter(padj_A_AEN < 0.05, log2FoldChange_A_AEN <0 )), " Percent: ",
+            nrow(lrt_res2 %>% filter(padj_A_AEN < 0.05, log2FoldChange_A_AEN <0 ))/nrow(lrt_res2),"%"
+            )
+      )
+print(paste0("UPregulated genes: ", 
+            nrow(lrt_res2 %>% filter(padj_A_AEN < 0.05, log2FoldChange_A_AEN >0 )), " Percent: ",
+            nrow(lrt_res2 %>% filter(padj_A_AEN < 0.05, log2FoldChange_A_AEN >0 ))/nrow(lrt_res2),"%"
+            )
+      )
+
+```
+
+# Volcano Plots of Differntially Expressed Genes  
+
+```{r}
+# genes of interest to label on volcano plots
+AvAN_gois <- c("Slc6a11", "Slc7a11", "Rasgrp1", "Fmo1", "Fam107a", "Dkk3", "Hapln1", "Ccl1", "Ccl2", "Ccl7", "Ccl12", "Ccr1", "Cxcl1", "Cxcl2")
+AvAE_gois <- c("Slc6a11", "Slc7a11", "Nrarp", "Vipr2", "Pxdn", "Lif", "Mapk4", "Aspg", "Ephb2")
+AvAEN_gois <- c("Slc6a11", "Slc7a11", "Nrarp", "Cldn10", "Rasgrp1", "Slc1a2", "Lif", "Agt", "Shh", "Pax2", "C1ql3", "Cdk15")
+```
+
+```{r}
+# find max x and y values  
+xmax <- max(lrt_res2 %>% filter(gene != "Defb11") %>% select(contains("Log2FoldChange_A_")) %>% as.data.frame())
+xmin <- min(lrt_res2 %>% filter(gene != "Defb11") %>% select(contains("Log2FoldChange_A_")) %>% as.data.frame())
+ymax <- max(apply(lrt_res2 %>% select(contains("padj_A_")) %>% as.data.frame(), 2, function(x) -log10(x)), na.rm = TRUE)
+
+```
+
+```{r A_AN_volcano}
+
+#pdf(file= "figures/A_AN_volcano.pdf", width = 9, height = 7)
+results_volcano(lrt_res2 %>% filter(gene != "Defb11"), "A", "AN", AvAN_gois) +
+  #ylim(0, ymax) +
+  xlim(xmin, xmax) +
+  ggtitle("A vs. AN") 
+#dev.off()
+```
+
+```{r A_EA_volcano}
+# pdf(file= "figures/A_EA_volcano.pdf", width = 9, height = 7)
+results_volcano(lrt_res2, "A", "AE", AvAE_gois) +
+  xlim(xmin, xmax) +
+  ggtitle("A vs. AE") 
+# dev.off()
+```
+
+```{r A_EAN_volcano}
+# pdf(file= "figures/A_EAN_volcano.pdf", width = 9, height = 7)
+results_volcano(lrt_res2, "A", "AEN", AvAEN_gois) +
+  xlim(xmin, xmax) +
+  ggtitle("A vs. AEN") 
+# dev.off()
+```
+
+
+
+
+## Heatmap of DEGs
+
+To fit on the plot only the top adjusted p-values from LRT are shown.
+
+```{r lrt_heatmap2}
+resultsHeatmapLRT <- function(results,vsd, meta_data, num_degs){
+  if(num_degs > nrow(results)){
+    num_degs = nrow(results)
+  }
+  selected <- results[1:num_degs,]
+  mat <- assay(vsd)[ rownames(selected), ]
+  mat <- mat - rowMeans(mat)
+  annotation_col <- meta_data %>% select(culture)
+  rownames(annotation_col) <- row.names(meta_data)
+  pheatmap(mat,
+           col = PurpleAndYellow(),
+           trace = "none",
+           fontsize_row = 7,
+           annotation_col = annotation_col, 
+           scale = "row",
+           border_color = NA,
+           width = 4,
+           height = 4
+  ) 
+}
+# pdf("figures/lrt_heatmap.pdf", height = 8, width = 5)
+resultsHeatmapLRT(lrt_sig, astro_vsd, astro_meta_data, 50)
+# dev.off()
+```
+
+## Gene Ontology Analysis of Clusters  
+Each cluster of differentially genes was tested if they were over-represented in the gene lists of Molecular Function and Biological Processes gene ontology terms. The combined resulted were saved to CSV and plotted below using the enrichplot package.    
+```{r}
+tibble_2_list <- function(tib){
+ return(tib %>% pull(gene)) 
+}
+
+cluster_list <- sig_all_res %>% select(gene, cluster) %>% group_split(cluster)
+names(cluster_list) <- c("C1", "C2", "C3", "C4", "C5", "C6", "S1", "S2", "NA")
+cluster_list2 <- lapply(cluster_list, function(tib){
+                                      return(tib %>% pull(gene))}
+                        )
+cluster_list2 <- cluster_list2[names(cluster_list2) != "NA"]
+cluster_list2 <- cluster_list2[c("S1", "S2", "C1", "C2", "C3", "C4", "C5", "C6")]
+cluster_enz_list <- lapply(cluster_list2, entrz)
+```
+
+```{r}
+cluster_go_mf <- compareCluster(geneCluster = cluster_list2, fun = enrichGO, OrgDb="org.Mm.eg.db", keyType = "SYMBOL",  ont="MF")
+cluster_go_mf <- pairwise_termsim(cluster_go_mf)
+cluster_go_mf2 <- simplify(cluster_go_mf, cutoff=0.7, by="p.adjust", select_fun=min)
+cluster_go_bp <- compareCluster(geneCluster = cluster_list2, fun = enrichGO, OrgDb="org.Mm.eg.db", keyType = "SYMBOL",  ont="BP")
+cluster_go_bp <- pairwise_termsim(cluster_go_bp)
+cluster_go_bp2 <- simplify(cluster_go_bp, cutoff=0.7, by="p.adjust", select_fun=min)
+
+```
+
+```{r}
+# Output combined gene ontology results to a TSV    
+bp <- cluster_go_bp2@compareClusterResult %>% mutate("Ontology" = "BP")
+mf <- cluster_go_mf2@compareClusterResult %>% mutate("Ontology" = "MF")
+write_tsv(bind_rows(bp, mf), "results/GO_results.tsv")
+```
+
+```{r cluster_mf, fig.width=6, fig.height=6}
+#pdf("figures/clusterGO_MF.pdf", height = 10, width = 10)
+enrichplot::dotplot(cluster_go_mf2, title = "Molecular Function") 
+#dev.off()
+```
+
+```{r cluster_bp}
+# pdf("figures/clusterGO_BP.pdf", height = 10, width = 10)
+enrichplot::dotplot(cluster_go_bp2, title = "Biological Process") 
+# dev.off()
+```
+
+```{r cluster_mf_network}
+#pdf("figures/clusterGO_MFnetwork.pdf", height = 7, width = 7)
+cnetplot(cluster_go_mf,
+         node_label="category",
+         layout =  "fr",
+         cex_gene = 10,
+         cex_category = 15) + 
+  ggtitle("Molecular Function") 
+#dev.off()
+```
+
+```{r cluster_bp_network}
+# pdf("figures/clusterGO_BPnetwork.pdf", height = 12, width = 12)
+cnetplot(cluster_go_bp2,
+         showCategory = 5,
+         node_label="category",
+         layout =  "kk",
+         cex_gene = 2,
+         cex_category = 5) + 
+  ggtitle("Biological Process")
+# dev.off()
+```
+
+
+# Comparison of triple co-culture to in vivo astrocyte maturation    
+To evaluate if the co-culture of astrocytes with neurons and/or endothelial cells recapitulates some of the aspects of astrocyte maturation during development we compared our data to two studies of astrocyte maturation.  
+  
+## Zhang et al, 2016
+
+```{r}
+zhang <- read.csv("data/zhang2016_table1.csv") %>%
+  mutate(Gene=replace(Gene, Gene=="AGXT2L1", "ETNPPL"),
+                                                         Gene=replace(Gene, Gene=="HIST1H2AI", "H2AC13"), ## Manual rename of outdated gene symbols  
+                                                         Gene=replace(Gene, Gene=="HIST1H3E", "H3C6"),
+                                                         Gene=replace(Gene, Gene=="HIST1H3B", "H3C2"), 
+                                                         Gene=replace(Gene, Gene=="HIST1H1B", "H1-5"),
+                                                         Gene=replace(Gene, Gene=="HIST1H2AC", "H2AC6"),
+                                                         Gene=replace(Gene, Gene=="HIST2H2AC", "H2AC20"),
+                                                         Gene=replace(Gene, Gene=="HIST1H1A", "H1-1"),
+                                                         Gene=replace(Gene, Gene=="HIST1H2BC", "H2BC4"),
+                                                      ) 
+
+human <- useEnsembl("ensembl", dataset = "hsapiens_gene_ensembl",  host = "https://dec2021.archive.ensembl.org/") # archive used due to incompatibility with package  
+mouse <- useEnsembl("ensembl", dataset = "mmusculus_gene_ensembl",  host = "https://dec2021.archive.ensembl.org/")
+
+gene_convert <- getLDS(attributes = c("hgnc_symbol"), 
+    filters = "hgnc_symbol", values = zhang$Gene, mart = human, 
+    attributesL = c("mgi_symbol"), martL = mouse)
+
+zhang_mouse <- zhang %>% left_join(gene_convert, by = c("Gene" = "HGNC.symbol")) %>% filter(State == "Mature") %>% select(-State)
+zhange_genes <- zhang_mouse %>% drop_na() %>% pull(MGI.symbol) 
+zhange_genes_select <- intersect(zhange_genes, row.names(assay(astro_vsd)))
+```
+
+```{r zhang_mat_heatmap}
+# pdf("figures/zhang_mature_genes_heatmap.pdf")
+colfunc <- colorRampPalette(c("magenta", "black", "yellow"))
+  mat <- assay(astro_vsd)[ zhange_genes_select, ]
+  annotation_col <- astro_meta_data %>% dplyr::select(culture)
+  rownames(annotation_col) <- row.names(astro_meta_data)
+  pheatmap(mat, cluster_rows = FALSE, cluster_cols = FALSE,
+                col = colfunc(100),
+                trace = "none",
+                fontsize_row = 7,
+                # annotation_col = annotation_col, 
+                #annotation_row = annotation_row,
+                scale = "row",
+                border_color = NA,
+                width = 4,
+                height = 4
+  ) 
+# dev.off()
+```
+
+```{r}
+selected_samples <- astro_meta_data #%>% filter(culture %in% c("A", "EAN")) 
+imm_mat_vsd <- assay(astro_vsd)[ zhange_genes_select, ] %>% as.data.frame() %>% dplyr::select(rownames(selected_samples))
+imm_mat_z <- t(apply(imm_mat_vsd, 1, scale))
+imm_mat_z <- as.data.frame(imm_mat_z)
+colnames(imm_mat_z) <- colnames(imm_mat_vsd)
+imm_mat_z$gene <- row.names(imm_mat_z)
+#imm_mat_z$state <- zhang_mouse %>% filter(MGI.symbol %in% zhange_genes_select) %>% pull(State)
+imm_mat_z <- imm_mat_z %>% gather("Sample", value = "z_score",  A_G1:EAN_G4) 
+imm_mat_z <- imm_mat_z %>% left_join(astro_meta_data %>% rownames_to_column("Sample") %>% select(Sample, culture), by = "Sample")
+
+```
+  
+### Genes in the Zhang list that are upregulated when astrocytes are co-cultured  
+  
+```{r}
+lrt_res2 %>% filter(gene %in% zhange_genes_select, ((padj_A_AEN < 0.05 & log2FoldChange_A_AEN >0) | (padj_A_AN < 0.05 & log2FoldChange_A_AN >0) | (padj_A_AE < 0.05 & log2FoldChange_A_AE >0)))
+```
+  
+### Genes in the Zhang list that are significant in the LRT  
+  
+```{r}
+lrt_res2 %>% filter(gene %in% zhange_genes_select, padj_lrt < 0.05)
+```
+
+## Lattke et. al, 2021
+
+Common mature and immature astrocyte-specific genes used as maturation signature.
+
+```{r}
+lattke_mature <- read.xlsx("data/41467_2021_24624_MOESM9_ESM.xlsx", sheetIndex = 2, startRow = 6, colIndex = 1)[[1]]
+lattke_immature <- read.xlsx("data/41467_2021_24624_MOESM9_ESM.xlsx", sheetIndex = 2, startRow = 6, colIndex = 2)[[1]]
+maturation_lists <- list("Zhang_maturation" = zhange_genes_select,
+                         "Lattke_mature" = lattke_mature,
+                         "Lattke_immmature" = lattke_immature)
+```
+
+### Heatmap of Lattke mature genes
+
+```{r}
+# pdf("figures/lattke_mature_genes_heatmap.pdf")
+colfunc <- colorRampPalette(c("magenta", "black", "yellow"))
+  mat <- assay(astro_vsd)[ lattke_mature %in% rownames(assay(astro_vsd)), ]
+  annotation_col <- astro_meta_data %>% dplyr::select(culture)
+  rownames(annotation_col) <- row.names(astro_meta_data)
+  # annotation_row <- zhang_mouse %>% filter(MGI.symbol %in% zhange_genes_select) %>% dplyr::select(State)
+  #rownames(annotation_row) <-zhange_genes_select
+  pheatmap(mat, cluster_rows = TRUE,
+                cluster_cols = FALSE,
+                main = "Lattke Mature Genes",
+                col = colfunc(100),
+                trace = "none",
+                show_rownames = FALSE, 
+                # annotation_col = annotation_col, 
+                #annotation_row = annotation_row,
+                scale = "row",
+                border_color = NA,
+                width = 4,
+                height = 4 
+  ) 
+# dev.off()
+```
+
+### Heatmap of Lattke immature genes
+
+```{r}
+# pdf("figures/lattke_immature_genes_heatmap.pdf")
+colfunc <- colorRampPalette(c("magenta", "black", "yellow"))
+  mat <- assay(astro_vsd)[ lattke_immature %in% rownames(assay(astro_vsd)), ]
+
+  pheatmap(mat, cluster_rows = TRUE,
+                cluster_cols = FALSE,
+                main = "Lattke Immature Genes",
+                col = colfunc(100),
+                trace = "none",
+                show_rownames = FALSE, 
+                # annotation_col = annotation_col, 
+                #annotation_row = annotation_row,
+                scale = "row",
+                border_color = NA,
+                width = 4,
+                height = 4 
+  ) 
+# dev.off()
+```
+
+## GSEA of Genes Associated with Astrocyte Maturation  
+To statistically test if the gene sets associated with astrocyte maturation from Zhang et. al and Lattke et. al show coordinated change upon astrocyte co-culture, we performed Gene Set Enrichment Analysis.  
+
+The ranked log-fold changes from each culture condition comparison were tested against each gene list.  
+
+Please see the paper for a discussion of the results.  
+
+### Astrocytes vs. Astrocytes with Neurons  
+
+```{r}
+lfc_ranked_AN <- lrt_res2 %>% #filter(gene %in% zhange_genes_select)%>%
+  select(gene, padj_A_AN, log2FoldChange_A_AN) %>%
+  arrange(log2FoldChange_A_AN) 
+
+```
+
+```{r}
+ranked_mat_AN <- lfc_ranked_AN$log2FoldChange_A_AN
+names(ranked_mat_AN) <- lfc_ranked_AN$gene
+```
+
+```{r}
+fgseaRes_AN <- fgsea(maturation_lists, ranked_mat_AN) %>%
+  mutate(comparison = "AvAN") %>%
+  relocate(comparison, pathway)
+```
+
+```{r gsea_AN}
+
+# plotGseaTable(maturation_lists, ranked_mat_AN, fgseaRes_AN)
+# pdf("figures/gsea_an.pdf")
+an_imm <- plotEnrichment(maturation_lists[[1]] , stats = ranked_mat_AN)  + ggtitle("Zhang mature")
+an_mat <- plotEnrichment(maturation_lists[[2]] , stats = ranked_mat_AN) + ggtitle("Lattke mature")
+an_zmat <- plotEnrichment(maturation_lists[[3]] , stats = ranked_mat_AN) + ggtitle("Lattke immature")
+ggarrange(an_imm, an_zmat, an_mat) 
+# dev.off()
+```
+
+### Astrocytes vs. Astrocytes with Endothelial cells  
+
+```{r}
+lfc_ranked_AE <- lrt_res2 %>% #filter(gene %in% zhange_genes_select)%>%
+  select(gene, padj_A_AE, log2FoldChange_A_AE) %>%
+  arrange(log2FoldChange_A_AE) 
+```
+
+```{r}
+ranked_mat_AE <- lfc_ranked_AE$log2FoldChange_A_AE
+names(ranked_mat_AE) <- lfc_ranked_AE$gene
+```
+
+```{r}
+fgseaRes_AE <- fgsea(maturation_lists, ranked_mat_AE) %>%
+  mutate(comparison = "AvAE") %>%
+  relocate(comparison, pathway)
+```
+
+```{r GSEA_AE}
+# plotGseaTable(maturation_lists, ranked_mat_AE, fgseaRes_AE)
+# pdf("figures/gsea_ae.pdf")
+ae_imm <- plotEnrichment(maturation_lists[[1]] , stats = ranked_mat_AE)  + ggtitle("Zhang mature")
+ae_mat <- plotEnrichment(maturation_lists[[2]] , stats = ranked_mat_AE)  + ggtitle("Lattke mature")
+ae_zmat <- plotEnrichment(maturation_lists[[3]] , stats = ranked_mat_AE) + ggtitle("Lattke immature")
+ggarrange(ae_zmat, ae_imm, ae_mat) 
+# dev.off()
+```
+
+### Astrocytes vs. Astrocytes with Neurons and Endothelial Cells  
+
+```{r}
+lfc_ranked_AEN <- lrt_res2 %>% #filter(gene %in% zhange_genes_select)%>%
+  select(gene, padj_A_AEN, log2FoldChange_A_AEN) %>%
+  arrange(log2FoldChange_A_AEN) 
+  
+```
+
+```{r}
+ranked_mat_AEN <- lfc_ranked_AEN$log2FoldChange_A_AEN
+names(ranked_mat_AEN) <- lfc_ranked_AEN$gene
+```
+
+```{r}
+fgseaRes_AEN <- fgsea(maturation_lists, ranked_mat_AEN) %>%
+  mutate(comparison = "AvAEN") %>%
+  relocate(comparison, pathway)
+```
+
+```{r GSEA_AEN}
+# plotGseaTable(maturation_lists, ranked_mat_AEN, fgseaRes_AEN)
+# pdf("figures/gsea_aen.pdf")
+aen_imm <- plotEnrichment(maturation_lists[[1]] , stats = ranked_mat_AEN) + ggtitle("Zhang mature")
+aen_mat <- plotEnrichment(maturation_lists[[2]] , stats = ranked_mat_AEN) + ggtitle("Lattke mature")
+aen_zmat <- plotEnrichment(maturation_lists[[3]] , stats = ranked_mat_AEN) + ggtitle("Lattke immature")
+ggarrange(aen_zmat, aen_imm, aen_mat) 
+# dev.off()
+```
+
+### Astrocytes with Neurons vs. Astrocytes with Neurons and Endothelial Cells  
+
+```{r}
+lfc_ranked_AN_AEN <- lrt_res2 %>% 
+  select(gene, padj_AN_AEN, log2FoldChange_AN_AEN) %>%
+  arrange(log2FoldChange_AN_AEN) 
+```
+
+```{r}
+ranked_mat_AN_AEN <- lfc_ranked_AN_AEN$log2FoldChange_AN_AEN
+names(ranked_mat_AN_AEN) <- lfc_ranked_AN_AEN$gene
+```
+
+```{r}
+fgseaRes_AN_AEN <- fgsea(maturation_lists, ranked_mat_AN_AEN) %>%
+  mutate(comparison = "ANvAEN") %>%
+  relocate(comparison, pathway)
+```
+
+```{r GSEA_AN_AEN}
+# plotGseaTable(maturation_lists, ranked_mat_AN_AEN, fgseaRes_AN_AEN)
+# pdf("figures/gsea_an_aen.pdf")
+an_aen_imm <- plotEnrichment(maturation_lists[[1]] , stats = ranked_mat_AN_AEN) + ggtitle("Zhang mature")
+an_aen_mat <- plotEnrichment(maturation_lists[[2]] , stats = ranked_mat_AN_AEN) + ggtitle("Lattke mature")
+an_aen_zmat <- plotEnrichment(maturation_lists[[3]] , stats = ranked_mat_AN_AEN) + ggtitle("Lattke immature")
+an_aen_plot <- ggarrange(an_aen_zmat, an_aen_imm, an_aen_mat ) 
+annotate_figure(an_aen_plot, top = text_grob("AN v. AEN", size = 14))
+# dev.off()
+```
+
+### Astrocytes with Endothelial Cells vs. Astrocytes with Neurons and Endothelial Cells  
+
+```{r}
+lfc_ranked_AE_AEN <- lrt_res2 %>% 
+  select(gene, padj_AE_AEN, log2FoldChange_AE_AEN) %>%
+  arrange(log2FoldChange_AE_AEN) 
+```
+
+```{r}
+ranked_mat_AE_AEN <- lfc_ranked_AE_AEN$log2FoldChange_AE_AEN
+names(ranked_mat_AE_AEN) <- lfc_ranked_AE_AEN$gene
+```
+
+```{r}
+fgseaRes_AE_AEN <- fgsea(maturation_lists, ranked_mat_AE_AEN) %>%
+  mutate(comparison = "AEvAEN") %>%
+  relocate(comparison, pathway)
+
+```
+
+```{r GSEA_AE_AEN}
+# plotGseaTable(maturation_lists, ranked_mat_AE_AEN, fgseaRes_AE_AEN )
+# pdf("figures/gsea_ae_aen.pdf")
+ae_aen_imm <- plotEnrichment(maturation_lists[[1]] , stats = ranked_mat_AE_AEN) + ggtitle("Zhang mature")
+ae_aen_mat <- plotEnrichment(maturation_lists[[2]] , stats = ranked_mat_AE_AEN) + ggtitle("Lattke mature")
+ae_aen_zmat <- plotEnrichment(maturation_lists[[3]] , stats = ranked_mat_AE_AEN) + ggtitle("Lattke immature")
+ae_aen_plot <- ggarrange(ae_aen_zmat, ae_aen_imm, ae_aen_mat ) 
+annotate_figure(ae_aen_plot, top = text_grob("AE v. AEN", size = 14))
+# dev.off()
+```
+
+```{r}
+# output a table of all GSEA data.  
+gsea_full <- rbind(fgseaRes_AN,
+                   fgseaRes_AE,
+                  fgseaRes_AEN,
+                  fgseaRes_AN_AEN,
+                  fgseaRes_AE_AEN)  
+gsea_full[,"padj"] <-  p.adjust(gsea_full$pval, method = "bonferroni", n=15) # Bonferroni correction for multiple tests  
+write_csv(gsea_full, file = "results/maturation_gsea.csv")
+gsea_full
+```
+
+# Environment
+
+```{r}
+sessionInfo()
+```
