@@ -1,0 +1,13 @@
+#! /bin/bash
+
+docker run -v /Volumes/two/DATA/Astro_Endo_Neuron_RNAseq/:/EAN -w /EAN  xinglab/rmats \
+--task both \
+--b1 splicing/A.txt \
+--b2 splicing/E.txt \
+--gtf mm10_withEGFP.gtf \
+-t paired \
+--libType fr-firststrand \
+--readLength 101 \
+--nthread 8 \
+--od A_E_out \
+--tmp A_E_temp 

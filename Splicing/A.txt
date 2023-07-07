@@ -1,0 +1,1 @@
+sargasso/results/filtered_reads/A_G1___mouse___filtered.sorted.bam,sargasso/results/filtered_reads/A_G2___mouse___filtered.sorted.bam,sargasso/results/filtered_reads/A_G3___mouse___filtered.sorted.bam,sargasso/results/filtered_reads/A_G4___mouse___filtered.sorted.bam,sargasso/results/filtered_reads/A_G5___mouse___filtered.sorted.bam
